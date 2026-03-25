@@ -47,19 +47,19 @@ npm install
 Run:
 
 ```bash
-npm run pull-and-filter
+npm run pull-and-filter-cli
 ```
 
 With preselected integrations:
 
 ```bash
-npm run pull-and-filter -- --integrations slack,salesforce
+npm run pull-and-filter-cli -- --integrations slack,salesforce
 ```
 
 Custom output:
 
 ```bash
-npm run pull-and-filter -- --output ./my-filtered-export.zip
+npm run pull-and-filter-cli -- --output ./my-filtered-export.zip
 ```
 
 At the end, the script can optionally push the filtered workspace to the target workspace with Membrane CLI `push`.
