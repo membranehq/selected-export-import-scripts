@@ -1,3 +1,5 @@
+![Membrane](https://getmembrane.com/_next/static/media/image-experience.15kkutt01f4at.avif)
+
 # Membrane Export Filter
 
 This project exports a Membrane workspace, lets you keep only selected integrations, and produces a filtered zip that can be imported into another workspace.
