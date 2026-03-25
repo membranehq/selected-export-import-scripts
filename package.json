@@ -1,0 +1,17 @@
+{
+  "name": "select-integrations-export",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pull a Membrane workspace and filter it down to selected integrations.",
+  "bin": {
+    "membrane-filter-export": "./scripts/filter-membrane-export-cli.js"
+  },
+  "scripts": {
+    "filter": "node ./scripts/filter-membrane-export-cli.js",
+    "pull-and-filter": "node ./scripts/filter-membrane-export-cli.js",
+    "export-and-filter-api": "node ./scripts/filter-membrane-export-api.js"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  }
+}
