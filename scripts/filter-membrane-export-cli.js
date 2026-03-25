@@ -30,9 +30,14 @@ const ROOT_REFERENCE_FIELDS = {
 };
 
 const REQUIRED_ENV_KEYS = [
-  "MEMBRANE_WORKSPACE_KEY",
-  "MEMBRANE_WORKSPACE_SECRET",
-  "MEMBRANE_API_URI",
+  "MEMBRANE_PULL_WORKSPACE_KEY",
+  "MEMBRANE_PULL_WORKSPACE_SECRET",
+  "MEMBRANE_PULL_API_URI",
+];
+
+const REQUIRED_PUSH_ENV_KEYS = [
+  "MEMBRANE_PUSH_WORKSPACE_KEY",
+  "MEMBRANE_PUSH_WORKSPACE_SECRET",
 ];
 
 async function main() {
@@ -54,10 +59,13 @@ async function main() {
   const pullDir = path.join(workspaceDir, "pulled-workspace");
 
   try {
+    // Export into a temp directory so filtering never mutates the user's repo files.
     await fsp.mkdir(pullDir, { recursive: true });
     await pullWorkspaceExport(pullDir, membraneEnv);
     const exportDir = await resolveExportRoot(pullDir);
 
+    // Build a dependency graph, keep the selected integrations, and preserve only
+    // the shared resources that those integrations still reference.
     const catalog = await buildCatalog(exportDir);
     if (catalog.integrations.length === 0) {
       throw new Error("No integrations were found after pulling the Membrane workspace.");
@@ -71,6 +79,14 @@ async function main() {
     console.log(`Created filtered export zip: ${outputZip}`);
     console.log(`Kept integrations: ${selection.selectedIntegrations.join(", ")}`);
     console.log(`Kept shared resources: ${selection.keptRootResources.length}`);
+
+    // Optional final step for sending the filtered workspace to a target workspace.
+    if (await askYesNo("Do you want to push this filtered workspace now?", false)) {
+      const pushEnv = buildPushMembraneEnv(envFromFile);
+      console.log(`Pushing filtered workspace to target workspace ${pushEnv.MEMBRANE_WORKSPACE_KEY}...`);
+      await pushWorkspaceExport(exportDir, pushEnv);
+      console.log("Push completed.");
+    }
   } finally {
     await removePath(workspaceDir);
   }
@@ -117,9 +133,12 @@ function printUsage() {
   console.log("  node scripts/filter-membrane-export-cli.js --env-file ./custom.env");
   console.log("");
   console.log("Environment:");
-  console.log("  MEMBRANE_WORKSPACE_KEY");
-  console.log("  MEMBRANE_WORKSPACE_SECRET");
-  console.log("  MEMBRANE_API_URI");
+  console.log("  MEMBRANE_PULL_WORKSPACE_KEY");
+  console.log("  MEMBRANE_PULL_WORKSPACE_SECRET");
+  console.log("  MEMBRANE_PULL_API_URI");
+  console.log("  MEMBRANE_PUSH_WORKSPACE_KEY");
+  console.log("  MEMBRANE_PUSH_WORKSPACE_SECRET");
+  console.log("  MEMBRANE_PUSH_API_URI (optional; defaults to MEMBRANE_PULL_API_URI)");
 }
 
 async function loadDotEnv(filePath) {
@@ -175,13 +194,54 @@ function buildMembraneEnv(envFromFile) {
   return mergedEnv;
 }
 
+function buildPushMembraneEnv(envFromFile) {
+  const mergedEnv = {
+    ...process.env,
+    ...envFromFile,
+  };
+
+  const missingKeys = REQUIRED_PUSH_ENV_KEYS.filter((key) => !mergedEnv[key]);
+  if (missingKeys.length > 0) {
+    throw new Error(`Missing required push environment variables: ${missingKeys.join(", ")}`);
+  }
+
+  return {
+    ...mergedEnv,
+    MEMBRANE_WORKSPACE_KEY: mergedEnv.MEMBRANE_PUSH_WORKSPACE_KEY,
+    MEMBRANE_WORKSPACE_SECRET: mergedEnv.MEMBRANE_PUSH_WORKSPACE_SECRET,
+    MEMBRANE_API_URI: mergedEnv.MEMBRANE_PUSH_API_URI || mergedEnv.MEMBRANE_PULL_API_URI,
+  };
+}
+
+function buildPullCliEnv(env) {
+  // The Membrane CLI expects generic MEMBRANE_WORKSPACE_* variables.
+  return {
+    ...env,
+    MEMBRANE_WORKSPACE_KEY: env.MEMBRANE_PULL_WORKSPACE_KEY,
+    MEMBRANE_WORKSPACE_SECRET: env.MEMBRANE_PULL_WORKSPACE_SECRET,
+    MEMBRANE_API_URI: env.MEMBRANE_PULL_API_URI,
+  };
+}
+
 async function pullWorkspaceExport(outputDir, env) {
   console.log("Pulling workspace from Membrane...");
+  const pullEnv = buildPullCliEnv(env);
   await runCommand(
     "npx",
     ["@membranehq/cli@latest", "pull"],
     {
       cwd: outputDir,
+      env: pullEnv,
+    },
+  );
+}
+
+async function pushWorkspaceExport(workspaceDir, env) {
+  await runCommand(
+    "npx",
+    ["@membranehq/cli@latest", "push"],
+    {
+      cwd: workspaceDir,
       env,
     },
   );
@@ -393,6 +453,8 @@ function computeSelection(catalog, selectedKeys) {
       keepConnectorsByKey.add(resource.key);
     }
 
+    // Shared root resources can reference other shared resources, so we follow
+    // those links until the required set is complete.
     for (const nextUuid of findLinkedRootResourceUuids(resource, catalog)) {
       if (!keepRootUuids.has(nextUuid)) {
         queue.push(nextUuid);
@@ -457,12 +519,14 @@ async function pruneExport(exportDir, catalog, selection) {
   const selectedIntegrationSet = new Set(selection.selectedIntegrations);
   const keptRootUuidSet = selection.keptRootUuids;
 
+  // Remove all integration folders the user did not keep.
   for (const integration of catalog.integrations) {
     if (!selectedIntegrationSet.has(integration.key)) {
       await removePath(path.join(exportDir, "integrations", integration.dirName));
     }
   }
 
+  // Remove any shared resource that is no longer referenced by the kept integrations.
   for (const resource of catalog.rootResources) {
     if (!resource.uuid || !keptRootUuidSet.has(resource.uuid)) {
       await removePath(resource.dirPath);
@@ -526,6 +590,25 @@ async function removePath(targetPath) {
 async function assertOutputDoesNotExist(outputPath) {
   if (await pathExists(outputPath)) {
     throw new Error(`Output file already exists: ${outputPath}`);
+  }
+}
+
+async function askYesNo(question, defaultValue) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const hint = defaultValue ? "Y/n" : "y/N";
+    const answer = (await rl.question(`${question} (${hint}): `)).trim().toLowerCase();
+    if (!answer) {
+      return defaultValue;
+    }
+
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
   }
 }
 
