@@ -31,9 +31,14 @@ const ROOT_REFERENCE_FIELDS = {
 };
 
 const REQUIRED_ENV_KEYS = [
-  "MEMBRANE_WORKSPACE_KEY",
-  "MEMBRANE_WORKSPACE_SECRET",
-  "MEMBRANE_API_URI",
+  "MEMBRANE_PULL_WORKSPACE_KEY",
+  "MEMBRANE_PULL_WORKSPACE_SECRET",
+  "MEMBRANE_PULL_API_URI",
+];
+
+const REQUIRED_PUSH_ENV_KEYS = [
+  "MEMBRANE_PUSH_WORKSPACE_KEY",
+  "MEMBRANE_PUSH_WORKSPACE_SECRET",
 ];
 
 const JOB_POLL_INTERVAL_MS = 2000;
@@ -59,10 +64,14 @@ async function main() {
   const extractedDir = path.join(workspaceDir, "extracted");
 
   try {
+    // Export through the API, download the archive, and unpack it in a temp folder
+    // so filtering can happen without touching project files.
     await exportWorkspaceZip(downloadedZipPath, membraneEnv);
     await extractZip(downloadedZipPath, extractedDir);
     const exportDir = await resolveExportRoot(extractedDir);
 
+    // Build a dependency graph, keep the selected integrations, and preserve only
+    // the shared resources those integrations still need.
     const catalog = await buildCatalog(exportDir);
     if (catalog.integrations.length === 0) {
       throw new Error("No integrations were found after exporting the Membrane workspace.");
@@ -76,6 +85,30 @@ async function main() {
     console.log(`Created filtered export zip: ${outputZip}`);
     console.log(`Kept integrations: ${selection.selectedIntegrations.join(", ")}`);
     console.log(`Kept shared resources: ${selection.keptRootResources.length}`);
+    console.log("");
+    console.log("The Membrane export has been downloaded and filtered.");
+    console.log(`Output file: ${outputZip}`);
+    console.log("");
+
+    // Optional import step into a different target workspace.
+    if (await askYesNo("Do you want to import this filtered zip now?", false)) {
+      const pushEnv = buildPushMembraneEnv(envFromFile);
+      const importOptions = await promptImportOptions();
+      const importResult = await importWorkspaceZip(outputZip, pushEnv, importOptions);
+      const logPath = await saveImportLog(projectRoot, {
+        timestamp: new Date().toISOString(),
+        targetWorkspaceKey: pushEnv.MEMBRANE_PUSH_WORKSPACE_KEY || pushEnv.MEMBRANE_WORKSPACE_KEY,
+        outputZip,
+        importOptions,
+        response: importResult,
+      });
+      console.log(`Saved import log: ${logPath}`);
+
+      if (await askYesNo("Do you want to delete the generated zip file now?", false)) {
+        await removePath(outputZip);
+        console.log(`Deleted zip file: ${outputZip}`);
+      }
+    }
   } finally {
     await removePath(workspaceDir);
   }
@@ -122,9 +155,12 @@ function printUsage() {
   console.log("  node scripts/filter-membrane-export-api.js --env-file ./custom.env");
   console.log("");
   console.log("Environment:");
-  console.log("  MEMBRANE_WORKSPACE_KEY");
-  console.log("  MEMBRANE_WORKSPACE_SECRET");
-  console.log("  MEMBRANE_API_URI");
+  console.log("  MEMBRANE_PULL_WORKSPACE_KEY");
+  console.log("  MEMBRANE_PULL_WORKSPACE_SECRET");
+  console.log("  MEMBRANE_PULL_API_URI");
+  console.log("  MEMBRANE_PUSH_WORKSPACE_KEY");
+  console.log("  MEMBRANE_PUSH_WORKSPACE_SECRET");
+  console.log("  MEMBRANE_PUSH_API_URI (optional; defaults to MEMBRANE_PULL_API_URI)");
 }
 
 async function loadDotEnv(filePath) {
@@ -180,11 +216,43 @@ function buildMembraneEnv(envFromFile) {
   return mergedEnv;
 }
 
+function buildPushMembraneEnv(envFromFile) {
+  const mergedEnv = {
+    ...process.env,
+    ...envFromFile,
+  };
+
+  const missingKeys = REQUIRED_PUSH_ENV_KEYS.filter((key) => !mergedEnv[key]);
+  if (missingKeys.length > 0) {
+    throw new Error(`Missing required push environment variables: ${missingKeys.join(", ")}`);
+  }
+
+  return {
+    ...mergedEnv,
+    MEMBRANE_WORKSPACE_KEY: mergedEnv.MEMBRANE_PUSH_WORKSPACE_KEY,
+    MEMBRANE_WORKSPACE_SECRET: mergedEnv.MEMBRANE_PUSH_WORKSPACE_SECRET,
+    MEMBRANE_API_URI: mergedEnv.MEMBRANE_PUSH_API_URI || mergedEnv.MEMBRANE_PULL_API_URI,
+  };
+}
+
+function buildPullApiEnv(env) {
+  // The API helpers use the generic MEMBRANE_WORKSPACE_* shape internally.
+  return {
+    ...env,
+    MEMBRANE_WORKSPACE_KEY: env.MEMBRANE_PULL_WORKSPACE_KEY,
+    MEMBRANE_WORKSPACE_SECRET: env.MEMBRANE_PULL_WORKSPACE_SECRET,
+    MEMBRANE_API_URI: env.MEMBRANE_PULL_API_URI,
+  };
+}
+
 async function exportWorkspaceZip(outputZipPath, env) {
   console.log("Exporting workspace from Membrane API...");
-  const adminToken = createAdminToken(env);
-  const apiBaseUrl = normalizeApiBaseUrl(env.MEMBRANE_API_URI);
+  const pullEnv = buildPullApiEnv(env);
+  const adminToken = createAdminToken(pullEnv);
+  const apiBaseUrl = normalizeApiBaseUrl(pullEnv.MEMBRANE_API_URI);
 
+  // Export starts a background job. The zip becomes available only after that
+  // job reaches "completed".
   const exportResponse = await fetch(`${apiBaseUrl}/export`, {
     method: "GET",
     headers: {
@@ -210,6 +278,47 @@ async function exportWorkspaceZip(outputZipPath, env) {
 
   console.log("Downloading exported workspace zip...");
   await downloadFile(downloadUrl, outputZipPath);
+}
+
+async function importWorkspaceZip(zipPath, env, importOptions) {
+  console.log(`Importing filtered zip to target workspace ${env.MEMBRANE_WORKSPACE_KEY}...`);
+  const adminToken = createAdminToken(env);
+  const apiBaseUrl = normalizeApiBaseUrl(env.MEMBRANE_API_URI);
+  const searchParams = new URLSearchParams({
+    dryRun: String(importOptions.dryRun),
+    partial: String(importOptions.partial),
+    diff: String(importOptions.diff),
+    force: String(importOptions.force),
+  });
+
+  const formData = new FormData();
+  const zipBuffer = await fsp.readFile(zipPath);
+  formData.append("file", new Blob([zipBuffer], { type: "application/zip" }), path.basename(zipPath));
+  formData.append("dryRun", String(importOptions.dryRun));
+
+  const response = await fetch(`${apiBaseUrl}/import?${searchParams.toString()}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${adminToken}`,
+      accept: "application/json",
+    },
+    body: formData,
+  });
+
+  const responseBody = await parseJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(
+      `Membrane import request failed (${response.status}): ${stringifyErrorBody(responseBody)}`,
+    );
+  }
+
+  if (isBackgroundJobResponse(responseBody)) {
+    // Some imports also run asynchronously and return a background job first.
+    const backgroundJobUrl = resolveBackgroundJobUrl(apiBaseUrl, responseBody, response);
+    return pollBackgroundJob(backgroundJobUrl, adminToken);
+  }
+
+  return responseBody;
 }
 
 function createAdminToken(env) {
@@ -345,6 +454,14 @@ async function downloadFile(url, destinationPath) {
 
   const arrayBuffer = await response.arrayBuffer();
   await fsp.writeFile(destinationPath, Buffer.from(arrayBuffer));
+}
+
+function isBackgroundJobResponse(body) {
+  return Boolean(
+    body &&
+      typeof body === "object" &&
+      (body.status || body.backgroundJobId || body.jobId || body.id || body.backgroundJobUrl || body.jobUrl),
+  );
 }
 
 function sleep(ms) {
@@ -592,6 +709,8 @@ function computeSelection(catalog, selectedKeys) {
       keepConnectorsByKey.add(resource.key);
     }
 
+    // Shared root resources can point to other shared resources, so we follow
+    // those references until the required set is complete.
     for (const nextUuid of findLinkedRootResourceUuids(resource, catalog)) {
       if (!keepRootUuids.has(nextUuid)) {
         queue.push(nextUuid);
@@ -656,12 +775,14 @@ async function pruneExport(exportDir, catalog, selection) {
   const selectedIntegrationSet = new Set(selection.selectedIntegrations);
   const keptRootUuidSet = selection.keptRootUuids;
 
+  // Remove all integration folders the user did not keep.
   for (const integration of catalog.integrations) {
     if (!selectedIntegrationSet.has(integration.key)) {
       await removePath(path.join(exportDir, "integrations", integration.dirName));
     }
   }
 
+  // Remove any shared resource that is no longer referenced by the kept integrations.
   for (const resource of catalog.rootResources) {
     if (!resource.uuid || !keptRootUuidSet.has(resource.uuid)) {
       await removePath(resource.dirPath);
@@ -726,6 +847,74 @@ async function assertOutputDoesNotExist(outputPath) {
   if (await pathExists(outputPath)) {
     throw new Error(`Output file already exists: ${outputPath}`);
   }
+}
+
+async function saveImportLog(projectRoot, payload) {
+  const logsDir = path.join(projectRoot, "logs");
+  await fsp.mkdir(logsDir, { recursive: true });
+
+  // Save the raw import response for auditing and debugging after the run finishes.
+  const timestamp = buildTimestampForFileName(new Date());
+  const logPath = path.join(logsDir, `membrane-import-${timestamp}.json`);
+  await fsp.writeFile(logPath, JSON.stringify(payload, null, 2));
+  return logPath;
+}
+
+function buildTimestampForFileName(date) {
+  const parts = [
+    date.getFullYear(),
+    padTwo(date.getMonth() + 1),
+    padTwo(date.getDate()),
+    "-",
+    padTwo(date.getHours()),
+    padTwo(date.getMinutes()),
+    padTwo(date.getSeconds()),
+  ];
+
+  return parts.join("");
+}
+
+function padTwo(value) {
+  return String(value).padStart(2, "0");
+}
+
+async function askYesNo(question, defaultValue) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const hint = defaultValue ? "Y/n" : "y/N";
+    const answer = (await rl.question(`${question} (${hint}): `)).trim().toLowerCase();
+    if (!answer) {
+      return defaultValue;
+    }
+
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+async function promptImportOptions() {
+  const dryRun = await askYesNo("Import with dryRun enabled?", false);
+  const partial = await askYesNo(
+    "Import with partial enabled? Existing elements not in the archive will be preserved.",
+    true,
+  );
+  const diff = await askYesNo("Import with diff enabled?", true);
+  const force = await askYesNo(
+    "Import with force enabled? This can bypass read-only restrictions and archive missing elements.",
+    false,
+  );
+
+  return {
+    dryRun,
+    partial,
+    diff,
+    force,
+  };
 }
 
 function walkObject(value, visitor) {

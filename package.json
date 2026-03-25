@@ -8,7 +8,7 @@
   },
   "scripts": {
     "filter": "node ./scripts/filter-membrane-export-cli.js",
-    "pull-and-filter": "node ./scripts/filter-membrane-export-cli.js",
+    "pull-and-filter-cli": "node ./scripts/filter-membrane-export-cli.js",
     "export-and-filter-api": "node ./scripts/filter-membrane-export-api.js"
   },
   "dependencies": {
